@@ -1,0 +1,11 @@
+name: cs6886-mlx-upsample
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pytest
+  - matplotlib
+  - pandas
+  - pip:
+      - mlx==0.32.4
