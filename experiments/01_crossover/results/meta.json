@@ -1,0 +1,21 @@
+{
+  "chip": "Apple M1",
+  "macos": "27.2",
+  "mlx": "0.32.4",
+  "python": "3.12.15",
+  "git_commit": null,
+  "timestamp": "2026-10-21T11:39:25.753520+00:00",
+  "args": {
+    "set": "all",
+    "passes": "both",
+    "smoke": "False",
+    "out": "None"
+  },
+  "variants": [
+    "gather",
+    "gather_compiled",
+    "matmul",
+    "pr4418"
+  ],
+  "seed": 0
+}
