@@ -1,0 +1,20 @@
+{
+  "chip": "Apple M1",
+  "macos": "27.2",
+  "mlx": "0.32.4",
+  "python": "3.12.15",
+  "git_commit": "01bac408b65bca3d9fc52055386113d7ab23e6e5",
+  "timestamp": "2026-10-25T06:05:11.927483+00:00",
+  "args": {
+    "smoke": "False",
+    "analyze": "False"
+  },
+  "variants": [
+    "fused",
+    "fused_cached",
+    "tables_only",
+    "floor",
+    "best_other"
+  ],
+  "seed": 0
+}
