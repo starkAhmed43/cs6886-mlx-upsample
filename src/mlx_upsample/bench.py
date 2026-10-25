@@ -1,4 +1,4 @@
-"""Timing, resumable JSONL result store, and environment metadata."""
+"""Timing, resumable JSONL result store, environment metadata, and the sweep loop."""
 
 import json
 import math
@@ -7,7 +7,7 @@ import random
 import subprocess
 import time
 from collections.abc import Callable
-from dataclasses import fields
+from dataclasses import asdict, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -112,6 +112,93 @@ class ResultStore:
         with self.path.open("rb") as f:
             f.seek(-1, 2)
             return f.read(1) == b"\n"
+
+
+def vjp_grad(f: Callable, x: mx.array, sf: tuple, ac: bool, cot: mx.array) -> mx.array:
+    return mx.vjp(lambda a: f(a, sf, ac), [x], [cot.astype(f(x, sf, ac).dtype)])[1][0]
+
+
+def maxdiff(a: mx.array, b: mx.array) -> float:
+    return mx.abs(a.astype(mx.float32) - b).max().item()
+
+
+def check(w: Workload, x: mx.array, f: Callable, pas: str, ref: dict, sf: tuple) -> dict:
+    """Shape, dtype and (for fwd_bwd) gradient check of variant `f` against `ref`."""
+    y = f(x, sf, w.align_corners)
+    diff = maxdiff(y, ref["y"])
+    valid = diff <= (1e-5 if w.dtype == "float32" else 1e-2)
+    row = {"out_shape": list(y.shape), "max_diff": diff}
+    if pas == "fwd_bwd":
+        gdiff = maxdiff(vjp_grad(f, x, sf, w.align_corners, ref["cot"]), ref["g"])
+        row |= {"grad_max_diff": gdiff, "grad_rel_err": gdiff / ref["gmax"] if ref["gmax"] else 0.0}
+        valid &= w.dtype != "float32" or row["grad_rel_err"] <= 1e-5  # float16 gradient error is recorded, not gated
+    return row | {"valid": bool(valid)}
+
+
+def write_meta(path: Path, args: dict, variant_names: list, seed: int) -> None:
+    path.write_text(json.dumps(
+        {**env_metadata(), "args": {k: str(v) for k, v in args.items()}, "variants": list(variant_names), "seed": seed},
+        indent=2,
+    ))
+
+
+def run_sweep(
+    store: ResultStore,
+    workloads: list[Workload],
+    variants: dict[str, Callable],
+    passes: list[str],
+    print_progress: bool = True,
+) -> None:
+    """Time and check every (workload, pass, variant) not already in `store`; append rows as they finish."""
+    from mlx_upsample.workloads import make_input
+
+    total, n = len(workloads) * len(passes) * len(variants), 0
+    for i, w in enumerate(workloads):
+        sf = (w.scale, w.scale)
+        x = make_input(w)
+        for pas in passes:
+            todo = [v for v in variants if not store.has(row_key({**asdict(w), "variant": v, "pass": pas}))]
+            n += len(variants) - len(todo)
+            if not todo:
+                continue
+            rows, ref = {}, {}
+            try:
+                y = variants["gather"](x, sf, w.align_corners)
+                ref["y"] = y.astype(mx.float32)
+                if pas == "fwd_bwd":
+                    ref["cot"] = mx.random.normal(y.shape, key=mx.random.key(0)).astype(mx.float32)
+                    ref["g"] = vjp_grad(variants["gather"], x.astype(mx.float32), sf, w.align_corners, ref["cot"])
+                    ref["gmax"] = mx.abs(ref["g"]).max().item()
+                mx.eval(ref)
+            except Exception as e:  # reference failure: every variant gets an error row
+                ref = {"error": f"reference: {e!r}"}
+            fns = {}
+            for v in todo:
+                try:
+                    if "error" in ref:
+                        raise RuntimeError(ref["error"])
+                    rows[v] = check(w, x, variants[v], pas, ref, sf)
+                    fns[v] = (make_fwd if pas == "fwd" else make_fwd_bwd)(variants[v], x, sf, w.align_corners)
+                except Exception as e:
+                    rows[v] = {"out_shape": None, "error": repr(e), "valid": False}
+            if fns:
+                try:
+                    times = time_interleaved(fns, seed=i)
+                except Exception as e:
+                    times = {}
+                    for v in fns:
+                        rows[v] |= {"error": f"timing: {e!r}", "valid": False}
+                for v, ms in times.items():
+                    rows[v] |= {"ms_median": sorted(ms)[len(ms) // 2], "ms_repeats": ms}
+            for v in todo:
+                n += 1
+                row = {**asdict(w), "variant": v, "pass": pas, **rows[v]}
+                store.append(row)
+                if print_progress:
+                    print(f"{n}/{total} {w.name} B={w.B} {w.dtype} {v} {pas} "
+                          f"{row.get('ms_median', float('nan')):.3f} ms{'' if row['valid'] else ' INVALID'}", flush=True)
+        x = ref = y = fns = rows = None
+        mx.clear_cache()
 
 
 def _run(*cmd: str) -> str | None:
