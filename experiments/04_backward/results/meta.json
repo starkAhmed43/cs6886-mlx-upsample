@@ -1,0 +1,20 @@
+{
+  "chip": "Apple M1",
+  "macos": "27.2",
+  "mlx": "0.32.4",
+  "python": "3.12.15",
+  "git_commit": "3b8faea558546348c7ac2d9754f7fa966eab0d33",
+  "timestamp": "2026-10-26T11:32:47.065336+00:00",
+  "args": {
+    "smoke": "False",
+    "out": "None",
+    "max_mb": "256"
+  },
+  "variants": [
+    "gather",
+    "matmul",
+    "pr4418",
+    "fused"
+  ],
+  "seed": 0
+}

@@ -10,6 +10,9 @@ from mlx_upsample.variants import VARIANTS
 from mlx_upsample.workloads import grid, real
 
 RESULTS = Path(__file__).parent / "results"
+# Pinned to the four stock variants from this experiment, so a rerun
+# reproduces it: VARIANTS has since grown a differentiable "fused" entry.
+STOCK_VARIANTS = {k: v for k, v in VARIANTS.items() if k != "fused"}
 SEED = 0
 SMOKE_GRID = [(64, 2, 4, "float32"), (128, 2, 32, "float16"), (192, 4, 4, "float32"), (64, 0.5, 32, "float32"), (256, 0.25, 4, "float16")]
 SMOKE_REAL = {"pspnet.bin6", "pspnet.bin2", "upernet.fpn16"}
@@ -37,9 +40,9 @@ def main():
     store = ResultStore(out)
     passes = ["fwd", "fwd_bwd"] if args.passes == "both" else [args.passes]
     ws = pick_workloads(args)
-    write_meta(out.parent / "meta.json", vars(args), list(VARIANTS), SEED)
+    write_meta(out.parent / "meta.json", vars(args), list(STOCK_VARIANTS), SEED)
 
-    run_sweep(store, ws, VARIANTS, passes)
+    run_sweep(store, ws, STOCK_VARIANTS, passes)
 
 
 if __name__ == "__main__":

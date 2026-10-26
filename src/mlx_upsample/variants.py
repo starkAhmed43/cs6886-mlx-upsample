@@ -6,6 +6,7 @@ from functools import lru_cache
 import mlx.core as mx
 
 from mlx_upsample.baselines import pr4418
+from mlx_upsample.kernels.bilinear import upsample as fused
 
 Variant = Callable[[mx.array, tuple[float, ...], bool], mx.array]
 
@@ -38,4 +39,5 @@ VARIANTS: dict[str, Variant] = {
     "gather_compiled": gather_compiled,
     "matmul": matmul,
     "pr4418": pr4418_shipped,
+    "fused": fused,
 }

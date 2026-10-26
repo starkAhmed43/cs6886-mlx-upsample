@@ -7,11 +7,13 @@ from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx.nn.layers.upsample import _linear_indices
 
 # The kernel bodies live next to this file, one per implementation.
 source = (Path(__file__).parent / "bilinear.metal").read_text()
 tiled_source = (Path(__file__).parent / "bilinear_tiled.metal").read_text()
+backward_source = (Path(__file__).parent / "bilinear_backward.metal").read_text()
 
 # Compile the Metal source into a kernel that Python can call.
 # input_names and output_names become the buffer names used in the source.
@@ -29,6 +31,15 @@ tiled_kernel = mx.fast.metal_kernel(
     input_names=["x", "y_l", "y_r", "y_w", "x_l", "x_r", "x_w"],
     output_names=["out"],
     source=tiled_source,
+)
+
+# Backward (gradient) kernel: one thread per INPUT pixel, gathering its share
+# of every output pixel's incoming gradient. See bilinear_backward.metal.
+backward_kernel = mx.fast.metal_kernel(
+    name="bilinear_upsample_backward",
+    input_names=["g", "y_l", "y_r", "y_w", "x_l", "x_r", "x_w", "y_lo", "y_hi", "x_lo", "x_hi"],
+    output_names=["gx"],
+    source=backward_source,
 )
 
 # Default tile size in output pixels: (tile_w, tile_h).
@@ -168,6 +179,98 @@ def fused(x: mx.array, scale_factor: tuple[float, float], align_corners: bool = 
     B, H, W, C = x.shape
     tables = _tables_cached(H, W, tuple(scale_factor), align_corners)
     return _launch(x, tables, tg_rows)
+
+
+def _range_tables(l: mx.array, r: mx.array, n_in: int) -> tuple:
+    """For each input index i, the [lo, hi) range of output indices that read it.
+
+    l and r are the forward tables for one axis (left/right neighbour per
+    output index); both are non-decreasing in the output index, and r is
+    never more than one past l. So output index o reads input index i only
+    if l[o] == i or r[o] == i, and the set of such o is one contiguous range
+    per i. np.searchsorted finds that range directly: lo is the first o with
+    r[o] >= i (the first o that could reach i from the right), hi is the
+    first o with l[o] > i (one past the last o that could reach i from the
+    left). An input pixel no output pixel reads (possible when
+    downscaling) gets lo == hi: an empty range, so its gradient is 0.
+    """
+    l_np, r_np = np.array(l), np.array(r)
+    idx = np.arange(n_in)
+    lo = np.searchsorted(r_np, idx, side="left")
+    hi = np.searchsorted(l_np, idx, side="right")
+    return mx.array(lo.astype(np.uint32)), mx.array(hi.astype(np.uint32))
+
+
+@lru_cache(maxsize=128)
+def _backward_tables_cached(H: int, W: int, scale_factor: tuple, align_corners: bool) -> tuple:
+    # Reuses the forward tables (also cached) to build the per-input-pixel
+    # ranges the backward kernel loops over. Cached for the same reason as
+    # `_tables_cached`: build once per shape, not once per call.
+    yl, yr, yw, xl, xr, xw = _tables_cached(H, W, scale_factor, align_corners)
+    y_lo, y_hi = _range_tables(yl, yr, H)
+    x_lo, x_hi = _range_tables(xl, xr, W)
+    mx.eval(y_lo, y_hi, x_lo, x_hi)
+    return y_lo, y_hi, x_lo, x_hi
+
+
+def _launch_backward(g: mx.array, fwd_tables: tuple, bwd_tables: tuple,
+                      B: int, H: int, W: int, C: int, dtype) -> mx.array:
+    """Run the backward kernel: g is the output-shaped cotangent, the result
+    is the input-shaped gradient, cast to `dtype` (the forward input's dtype).
+    """
+    yl, yr, yw, xl, xr, xw = fwd_tables
+    y_lo, y_hi, x_lo, x_hi = bwd_tables
+    Ho, Wo = yl.size, xl.size
+    Cc = min(C, 32)
+    return backward_kernel(
+        inputs=[g, yl, yr, yw, xl, xr, xw, y_lo, y_hi, x_lo, x_hi],
+        template=[("T", dtype), ("C", C), ("H_in", H), ("W_in", W),
+                  ("H_out", Ho), ("W_out", Wo)],
+        # grid = total threads: one per input value (channels, columns,
+        # batch * rows), same layout as the forward kernel's output grid.
+        grid=(C, W, B * H),
+        threadgroup=(Cc, 8, 1),
+        output_shapes=[(B, H, W, C)],
+        output_dtypes=[dtype],
+    )[0]
+
+
+@lru_cache(maxsize=128)
+def _custom_upsample(scale_factor: tuple, align_corners: bool):
+    # One mx.custom_function per (scale_factor, align_corners): the forward
+    # and backward kernels are both compiled and cached per-shape already
+    # (via _tables_cached / _backward_tables_cached), so this only needs to
+    # exist once per setting, not once per call.
+    @mx.custom_function
+    def f(x):
+        B, H, W, C = x.shape
+        tables = _tables_cached(H, W, scale_factor, align_corners)
+        return _launch(x, tables, tg_rows=1)
+
+    @f.vjp
+    def f_vjp(x, cotangent, output):
+        B, H, W, C = x.shape
+        fwd_tables = _tables_cached(H, W, scale_factor, align_corners)
+        bwd_tables = _backward_tables_cached(H, W, scale_factor, align_corners)
+        return _launch_backward(cotangent, fwd_tables, bwd_tables, B, H, W, C, x.dtype)
+
+    return f
+
+
+def upsample(x: mx.array, scale_factor: tuple[float, float], align_corners: bool = False) -> mx.array:
+    """Differentiable bilinear upsampling, same signature as the variants in
+    variants.py and the same forward result as `fused`.
+
+    Unlike `fused`, this works under mx.vjp / mx.grad: it is built with
+    mx.custom_function, with the backward kernel in bilinear_backward.metal
+    supplying the gradient (mx.fast.metal_kernel's own vjp is not
+    implemented, so plain `fused` cannot be differentiated).
+
+    The kernels index with 32-bit integers, so input and output must stay
+    well under 2**32 elements.
+    """
+    f = _custom_upsample(tuple(scale_factor), align_corners)
+    return f(x)
 
 
 def fused_tiled(x: mx.array, scale_factor: tuple[float, float], align_corners: bool = False,
