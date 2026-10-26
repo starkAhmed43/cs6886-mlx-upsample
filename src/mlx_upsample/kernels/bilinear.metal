@@ -22,9 +22,11 @@ uint oy = thread_position_in_grid.z % H_out;
 uint b = thread_position_in_grid.z / H_out;
 
 // Guard: threads outside the output must do nothing.
-// Metal rounds the launch up to whole threadgroups, so it can start more
-// threads than "grid" asks for (for example C=33 with threadgroup x=32).
-// The extra threads land outside the output. This guard keeps them safe.
+// MLX's metal_kernel dispatches with Metal's non-uniform threadgroups
+// (dispatchThreads), so edge threadgroups shrink and no thread lands
+// outside "grid" under the current dispatch. This guard is a cheap safety
+// check that costs nothing: it keeps the kernel correct if it is ever
+// launched with a grid rounded up to whole threadgroups instead.
 if (c >= C || ox >= W_out) return;
 
 // For each axis: two neighbour input indices (l = left/low, r = right/high).

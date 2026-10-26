@@ -1,0 +1,22 @@
+{
+  "chip": "Apple M1",
+  "macos": "27.2",
+  "mlx": "0.32.4",
+  "python": "3.12.15",
+  "git_commit": "65d881fddcdf67aa725cc374b71281b2f0203679",
+  "timestamp": "2026-10-26T06:59:03.489559+00:00",
+  "args": {
+    "smoke": "False",
+    "analyze": "False",
+    "max_mb": "256"
+  },
+  "variants": [
+    "gather",
+    "fused",
+    "tiled_8x2",
+    "tiled_8x4",
+    "tiled_16x4",
+    "tiled_8x8"
+  ],
+  "seed": 0
+}
