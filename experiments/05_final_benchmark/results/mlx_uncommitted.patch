@@ -1,0 +1,1063 @@
+diff --git a/docs/src/python/fast.rst b/docs/src/python/fast.rst
+index c930c7bb4..7ddc3dfef 100644
+--- a/docs/src/python/fast.rst
++++ b/docs/src/python/fast.rst
+@@ -12,6 +12,7 @@ Fast
+   layer_norm
+   cross_entropy
+   rope
++  upsample_bilinear
+   scaled_dot_product_attention
+   metal_kernel
+   cuda_kernel
+diff --git a/mlx/backend/cuda/primitives.cpp b/mlx/backend/cuda/primitives.cpp
+index 104c7fd3f..94b9e4eef 100644
+--- a/mlx/backend/cuda/primitives.cpp
++++ b/mlx/backend/cuda/primitives.cpp
+@@ -53,6 +53,8 @@ NO_GPU_MULTI(Eigh)
+ namespace fast {
+ NO_GPU_MULTI(GatedDeltaUpdate)
+ NO_GPU_MULTI(GatedDeltaUpdateVJP)
++NO_GPU_USE_FALLBACK(UpsampleBilinear)
++NO_GPU_MULTI(UpsampleBilinearVJP)
+ } // namespace fast
+ 
+ namespace distributed {
+diff --git a/mlx/backend/metal/CMakeLists.txt b/mlx/backend/metal/CMakeLists.txt
+index cccaad8a5..4b9d48eb8 100644
+--- a/mlx/backend/metal/CMakeLists.txt
++++ b/mlx/backend/metal/CMakeLists.txt
+@@ -155,6 +155,7 @@ target_sources(
+           ${CMAKE_CURRENT_SOURCE_DIR}/ternary.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/unary.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/resident.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/upsample.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp)
+ 
+ if(NOT MLX_METAL_PATH)
+diff --git a/mlx/backend/metal/kernels/CMakeLists.txt b/mlx/backend/metal/kernels/CMakeLists.txt
+index 355c763a3..d15601630 100644
+--- a/mlx/backend/metal/kernels/CMakeLists.txt
++++ b/mlx/backend/metal/kernels/CMakeLists.txt
+@@ -55,6 +55,7 @@ build_kernel(layer_norm)
+ build_kernel(random)
+ build_kernel(rms_norm)
+ build_kernel(rope)
++build_kernel(upsample)
+ build_kernel(scaled_dot_product_attention sdpa_blocked.h sdpa_vector.h)
+ build_kernel(scaled_dot_product_attention_vjp)
+ build_kernel(gated_delta_update gated_delta_update.h)
+diff --git a/mlx/backend/no_gpu/primitives.cpp b/mlx/backend/no_gpu/primitives.cpp
+index e3ee598ea..ab87f269c 100644
+--- a/mlx/backend/no_gpu/primitives.cpp
++++ b/mlx/backend/no_gpu/primitives.cpp
+@@ -198,6 +198,8 @@ NO_GPU_MULTI(LayerNormVJP)
+ NO_GPU_USE_FALLBACK(RMSNorm)
+ NO_GPU_MULTI(RMSNormVJP)
+ NO_GPU_USE_FALLBACK(RoPE)
++NO_GPU_USE_FALLBACK(UpsampleBilinear)
++NO_GPU_MULTI(UpsampleBilinearVJP)
+ NO_GPU_MULTI(ScaledDotProductAttention)
+ NO_GPU_MULTI(ScaledDotProductAttentionVJP)
+ NO_GPU_MULTI(GatedDeltaUpdate)
+diff --git a/mlx/export.cpp b/mlx/export.cpp
+index c10934d1b..d15155563 100644
+--- a/mlx/export.cpp
++++ b/mlx/export.cpp
+@@ -464,6 +464,8 @@ struct PrimitiveFactory {
+       SERIALIZE_PRIMITIVE(LayerNorm),
+       SERIALIZE_PRIMITIVE(LayerNormVJP),
+       SERIALIZE_PRIMITIVE(RoPE),
++      SERIALIZE_PRIMITIVE(UpsampleBilinear),
++      SERIALIZE_PRIMITIVE(UpsampleBilinearVJP),
+       SERIALIZE_PRIMITIVE(ScaledDotProductAttention),
+       SERIALIZE_PRIMITIVE(CustomKernel)};
+   std::unordered_map<std::string, std::string> name_remap;
+diff --git a/mlx/fast.cpp b/mlx/fast.cpp
+index 2afb83416..634c560f5 100644
+--- a/mlx/fast.cpp
++++ b/mlx/fast.cpp
+@@ -1,4 +1,5 @@
+ // Copyright © 2023-2026 Apple Inc.
++#include <algorithm>
+ #include <cassert>
+ #include <numeric>
+ 
+@@ -1245,4 +1246,148 @@ bool ConvertFP8::is_equivalent(const Primitive& other) const {
+   return to_fp8_ == a_other.to_fp8_;
+ }
+ 
++namespace {
++
++// Per-axis sampling parameters, matching nn.Upsample's linear mode.
++struct AxisParams {
++  int out_size;
++  float step;
++  float start;
++};
++
++AxisParams upsample_axis_params(int in_size, double scale, bool align_corners) {
++  int out_size = static_cast<int>(scale * in_size);
++  double step, start;
++  if (align_corners) {
++    step = static_cast<double>(in_size - 1) / std::max(out_size - 1, 1);
++    start = 0.0;
++  } else {
++    step = 1.0 / scale;
++    start = ((out_size - 1) * step - in_size + 1) / 2.0;
++  }
++  return {out_size, static_cast<float>(step), static_cast<float>(start)};
++}
++
++// Interpolate along one spatial axis with the same float32 arithmetic as the
++// forward and backward kernels.
++array upsample_axis(
++    const array& x,
++    int axis,
++    int in_size,
++    const AxisParams& p,
++    StreamOrDevice s) {
++  auto idx = subtract(
++      multiply(arange(p.out_size, float32, s), array(p.step, float32), s),
++      array(p.start, float32),
++      s);
++  idx = clip(idx, array(0.0f), array(static_cast<float>(in_size - 1)), s);
++  auto idx_l = floor(idx, s);
++  auto idx_r = ceil(idx, s);
++  auto t = subtract(idx, idx_l, s);
++  Shape t_shape(x.ndim(), 1);
++  t_shape[axis] = p.out_size;
++  t = reshape(t, t_shape, s);
++  auto lo = take(x, astype(idx_l, uint32, s), axis, s);
++  auto hi = take(x, astype(idx_r, uint32, s), axis, s);
++  return add(
++      multiply(lo, subtract(array(1.0f), t, s), s), multiply(hi, t, s), s);
++}
++
++} // namespace
++
++array upsample_bilinear(
++    const array& x,
++    std::pair<double, double> scale_factor,
++    bool align_corners /* = false */,
++    StreamOrDevice s_ /* = {} */) {
++  if (x.ndim() != 4) {
++    std::ostringstream msg;
++    msg << "[upsample_bilinear] Input must be 4D (B, H, W, C) but got input "
++           "with "
++        << x.ndim() << " dimensions.";
++    throw std::invalid_argument(msg.str());
++  }
++  if (issubdtype(x.dtype(), complexfloating)) {
++    throw std::invalid_argument(
++        "[upsample_bilinear] Complex input is not supported.");
++  }
++  auto [scale_h, scale_w] = scale_factor;
++  if (scale_h <= 0 || scale_w <= 0) {
++    throw std::invalid_argument(
++        "[upsample_bilinear] scale_factor must be positive.");
++  }
++
++  int H = x.shape(1);
++  int W = x.shape(2);
++  auto ph = upsample_axis_params(H, scale_h, align_corners);
++  auto pw = upsample_axis_params(W, scale_w, align_corners);
++
++  auto s = to_stream(s_);
++  auto out_type = issubdtype(x.dtype(), floating) ? x.dtype() : float32;
++
++  auto fallback =
++      [ph, pw, H, W, out_type, s](const std::vector<array>& inputs) {
++        auto y = astype(inputs[0], float32, s);
++        y = upsample_axis(y, 1, H, ph, s);
++        y = upsample_axis(y, 2, W, pw, s);
++        return std::vector<array>{astype(y, out_type, s)};
++      };
++
++  int64_t out_elements =
++      static_cast<int64_t>(x.shape(0)) * ph.out_size * pw.out_size * x.shape(3);
++  bool large =
++      x.size() >= (int64_t(1) << 31) || out_elements >= (int64_t(1) << 31);
++  bool empty = x.size() == 0 || out_elements == 0;
++
++  if (!large && !empty && !UpsampleBilinear::use_fallback(s)) {
++    return array(
++        {x.shape(0), ph.out_size, pw.out_size, x.shape(3)},
++        out_type,
++        std::make_shared<UpsampleBilinear>(
++            s,
++            fallback,
++            ph.out_size,
++            pw.out_size,
++            ph.step,
++            ph.start,
++            pw.step,
++            pw.start),
++        {astype(x, out_type, s)});
++  }
++  return fallback({x})[0];
++}
++
++std::vector<array> UpsampleBilinear::vjp(
++    const std::vector<array>& primals,
++    const std::vector<array>& cotangents,
++    const std::vector<int>& argnums,
++    const std::vector<array>& outputs) {
++  if (argnums.size() != 1 || argnums[0] != 0) {
++    throw std::invalid_argument(
++        "[upsample_bilinear] vjp is only supported with respect to the "
++        "input.");
++  }
++  auto& x = primals[0];
++  auto s = stream();
++  auto in_shape = x.shape();
++  auto in_dtype = x.dtype();
++  int in_h = in_shape[1];
++  int in_w = in_shape[2];
++
++  auto fwd_fallback = fallback_;
++  auto vjp_fallback =
++      [fwd_fallback, in_shape, in_dtype, s](const std::vector<array>& inputs) {
++        auto zero_x = zeros(in_shape, in_dtype, s);
++        auto [_, vjps] = mlx::core::vjp(fwd_fallback, {zero_x}, {inputs[0]});
++        return vjps;
++      };
++
++  return {array(
++      in_shape,
++      in_dtype,
++      std::make_shared<UpsampleBilinearVJP>(
++          s, vjp_fallback, in_h, in_w, step_h_, start_h_, step_w_, start_w_),
++      {astype(cotangents[0], in_dtype, s)})};
++}
++
+ } // namespace mlx::core::fast
+diff --git a/mlx/fast.h b/mlx/fast.h
+index 14a46de65..1813d60d3 100644
+--- a/mlx/fast.h
++++ b/mlx/fast.h
+@@ -70,6 +70,13 @@ MLX_API std::vector<array> gated_delta_update(
+     const std::optional<array>& mask = std::nullopt,
+     StreamOrDevice s = {});
+ 
++/** Fused 2D bilinear upsample. Input x has shape (B, H, W, C). */
++MLX_API array upsample_bilinear(
++    const array& x,
++    std::pair<double, double> scale_factor,
++    bool align_corners = false,
++    StreamOrDevice s = {});
++
+ using TemplateArg = std::variant<int, bool, Dtype>;
+ using ScalarArg = std::variant<bool, int, float>;
+ 
+diff --git a/mlx/fast_primitives.h b/mlx/fast_primitives.h
+index 8117a7a7b..f2dbff493 100644
+--- a/mlx/fast_primitives.h
++++ b/mlx/fast_primitives.h
+@@ -503,6 +503,122 @@ class Quantize : public Custom {
+   bool dequantize_;
+ };
+ 
++// step/start define each output index's source coordinate on one spatial
++// axis; the Metal backend turns them into per-axis lookup tables.
++class UpsampleBilinear : public Custom {
++ public:
++  UpsampleBilinear(
++      Stream stream,
++      std::function<std::vector<array>(std::vector<array>)> fallback,
++      int out_h,
++      int out_w,
++      float step_h,
++      float start_h,
++      float step_w,
++      float start_w)
++      : Custom(stream, std::move(fallback)),
++        out_h_(out_h),
++        out_w_(out_w),
++        step_h_(step_h),
++        start_h_(start_h),
++        step_w_(step_w),
++        start_w_(start_w) {}
++
++  static bool use_fallback(Stream s);
++
++  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
++      override {
++    throw std::runtime_error("NYI");
++  }
++  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
++      override;
++
++  std::vector<array> vjp(
++      const std::vector<array>& primals,
++      const std::vector<array>& cotangents,
++      const std::vector<int>& argnums,
++      const std::vector<array>& outputs) override;
++
++  DEFINE_NAME(UpsampleBilinear)
++  bool is_equivalent(const Primitive& other) const override {
++    auto& o = static_cast<const UpsampleBilinear&>(other);
++    return out_h_ == o.out_h_ && out_w_ == o.out_w_ && step_h_ == o.step_h_ &&
++        start_h_ == o.start_h_ && step_w_ == o.step_w_ &&
++        start_w_ == o.start_w_;
++  }
++  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
++    auto shape = inputs[0].shape();
++    shape[1] = out_h_;
++    shape[2] = out_w_;
++    return {shape};
++  }
++  auto state() const {
++    return std::make_tuple(
++        nullptr, out_h_, out_w_, step_h_, start_h_, step_w_, start_w_);
++  }
++
++ private:
++  int out_h_;
++  int out_w_;
++  float step_h_;
++  float start_h_;
++  float step_w_;
++  float start_w_;
++};
++
++class UpsampleBilinearVJP : public Custom {
++ public:
++  UpsampleBilinearVJP(
++      Stream stream,
++      std::function<std::vector<array>(std::vector<array>)> fallback,
++      int in_h,
++      int in_w,
++      float step_h,
++      float start_h,
++      float step_w,
++      float start_w)
++      : Custom(stream, std::move(fallback)),
++        in_h_(in_h),
++        in_w_(in_w),
++        step_h_(step_h),
++        start_h_(start_h),
++        step_w_(step_w),
++        start_w_(start_w) {}
++
++  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
++      override {
++    throw std::runtime_error("NYI");
++  }
++  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
++      override;
++
++  DEFINE_NAME(UpsampleBilinearVJP)
++  bool is_equivalent(const Primitive& other) const override {
++    auto& o = static_cast<const UpsampleBilinearVJP&>(other);
++    return in_h_ == o.in_h_ && in_w_ == o.in_w_ && step_h_ == o.step_h_ &&
++        start_h_ == o.start_h_ && step_w_ == o.step_w_ &&
++        start_w_ == o.start_w_;
++  }
++  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
++    auto shape = inputs[0].shape();
++    shape[1] = in_h_;
++    shape[2] = in_w_;
++    return {shape};
++  }
++  auto state() const {
++    return std::make_tuple(
++        nullptr, in_h_, in_w_, step_h_, start_h_, step_w_, start_w_);
++  }
++
++ private:
++  int in_h_;
++  int in_w_;
++  float step_h_;
++  float start_h_;
++  float step_w_;
++  float start_w_;
++};
++
+ using ScalarArg = std::variant<bool, int, float>;
+ 
+ class CustomKernel : public Primitive {
+diff --git a/python/mlx/nn/layers/upsample.py b/python/mlx/nn/layers/upsample.py
+index 208b15571..a3c4d43f7 100644
+--- a/python/mlx/nn/layers/upsample.py
++++ b/python/mlx/nn/layers/upsample.py
+@@ -295,6 +295,8 @@ def upsample_linear(
+     antialias: bool = False,
+ ):
+     _validate_antialias_align_corners(align_corners, antialias)
++    if x.ndim == 4 and not antialias:
++        return mx.fast.upsample_bilinear(x, tuple(scale_factor), align_corners)
+     if antialias:
+         return _interpolate_separable(
+             x=x,
+diff --git a/python/src/fast.cpp b/python/src/fast.cpp
+index f9c472ab9..334d653d9 100644
+--- a/python/src/fast.cpp
++++ b/python/src/fast.cpp
+@@ -204,6 +204,36 @@ void init_fast(nb::module_& parent_module) {
+             ``targets``.
+       )pbdoc");
+ 
++  m.def(
++      "upsample_bilinear",
++      &mx::fast::upsample_bilinear,
++      "x"_a,
++      "scale_factor"_a,
++      "align_corners"_a = false,
++      nb::kw_only(),
++      "stream"_a = nb::none(),
++      nb::sig(
++          "def upsample_bilinear(x: array, scale_factor: tuple[float, float], align_corners: bool = False, *, stream: StreamOrDevice = None) -> array"),
++      R"pbdoc(
++        Fused 2D bilinear upsample.
++
++        The input ``x`` has shape ``(B, H, W, C)``. The output size per
++        spatial axis is ``int(scale * N)`` where ``N`` is the input size and
++        ``scale`` is the matching entry of ``scale_factor``. Floating point
++        inputs keep their dtype in the output; other inputs are computed and
++        returned in ``float32``.
++
++        Args:
++            x (array): Input array with shape ``(B, H, W, C)``.
++            scale_factor (tuple[float, float]): The multiplier for the
++              height and width axes.
++            align_corners (bool, optional): Whether to align the corners
++              of the input and output. Default: ``False``.
++
++        Returns:
++            array: The upsampled array.
++      )pbdoc");
++
+   m.def(
+       "rope",
+       [](const mx::array& a,
+diff --git a/python/tests/test_export_import.py b/python/tests/test_export_import.py
+index b8de6ce48..c064b8399 100644
+--- a/python/tests/test_export_import.py
++++ b/python/tests/test_export_import.py
+@@ -391,6 +391,20 @@ class TestExportImport(mlx_tests.MLXTestCase):
+         expected = forward(input_data)
+         self.assertTrue(mx.allclose(expected, out))
+ 
++    def test_export_upsample_bilinear(self):
++        path = os.path.join(self.test_dir, "upsample_bilinear.mlxfn")
++
++        def fun(x):
++            return mx.fast.upsample_bilinear(x, (2.0, 3.0), align_corners=True)
++
++        x = mx.random.normal(shape=(2, 7, 5, 4))
++        mx.export_function(path, fun, x)
++
++        imported = mx.import_function(path)
++        expected = fun(x)
++        out = imported(x)[0]
++        self.assertTrue(mx.allclose(out, expected))
++
+     def test_export_conv_shapeless(self):
+         # Conv1d (NLC)
+         path = os.path.join(self.test_dir, "conv1d.mlxfn")
+diff --git a/python/tests/test_fast.py b/python/tests/test_fast.py
+index dfdcc1824..d4e4a7164 100644
+--- a/python/tests/test_fast.py
++++ b/python/tests/test_fast.py
+@@ -5,7 +5,15 @@ import os
+ import unittest
+ 
+ import mlx.core as mx
++import mlx.nn as nn
+ import mlx_tests
++from mlx.nn.layers.upsample import _interpolate_separable, _linear_indices
++
++
++def _upsample_ref(x, scale, align_corners):
++    return _interpolate_separable(
++        x.astype(mx.float32), scale, _linear_indices, align_corners
++    )
+ 
+ 
+ def rope_orig(x, dims, traditional, base, scale, offset, freqs=None):
+@@ -1303,6 +1311,220 @@ class TestFast(mlx_tests.MLXTestCase):
+         mx.eval(out)
+         self.assertEqual(out.tolist(), [-1, -1, -1, -1])
+ 
++    def _upsample_devices(self):
++        devices = [mx.cpu]
++        if mx.metal.is_available():
++            devices = [mx.gpu, mx.cpu]
++        return devices
++
++    def test_upsample_bilinear_forward(self):
++        scales = [
++            (2.0, 2.0),
++            (4.0, 4.0),
++            (1.5, 1.5),
++            (3.0, 3.0),
++            (0.5, 0.5),
++            (0.25, 0.25),
++            (2.0, 3.0),
++        ]
++        dtypes = [(mx.float32, 1e-5), (mx.float16, 2e-2), (mx.bfloat16, 6e-2)]
++        for dev in self._upsample_devices():
++            with mx.stream(dev):
++                for scale in scales:
++                    for align_corners in (False, True):
++                        for B in (1, 2):
++                            for C in (1, 4, 32):
++                                x = mx.random.uniform(shape=(B, 7, 5, C))
++                                for dtype, atol in dtypes:
++                                    xd = x.astype(dtype)
++                                    out = mx.fast.upsample_bilinear(
++                                        xd, scale, align_corners
++                                    )
++                                    ref = _upsample_ref(xd, scale, align_corners)
++                                    self.assertEqual(out.dtype, dtype)
++                                    self.assertTrue(
++                                        mx.allclose(
++                                            out.astype(mx.float32),
++                                            ref.astype(mx.float32),
++                                            atol=atol,
++                                        )
++                                    )
++
++    def test_upsample_bilinear_single_pixel(self):
++        # PSPNet-style 1x1 input upsampled with a large scale factor.
++        for dev in self._upsample_devices():
++            with mx.stream(dev):
++                x = mx.random.uniform(shape=(1, 1, 1, 512))
++                out = mx.fast.upsample_bilinear(x, (60.0, 60.0), False)
++                ref = _upsample_ref(x, (60.0, 60.0), False)
++                self.assertTrue(mx.allclose(out, ref, atol=1e-5))
++
++    def test_upsample_bilinear_int_input(self):
++        for dev in self._upsample_devices():
++            with mx.stream(dev):
++                x = mx.arange(1 * 4 * 4 * 2, dtype=mx.int32).reshape(1, 4, 4, 2)
++                out = mx.fast.upsample_bilinear(x, (2.0, 2.0), False)
++                ref = _upsample_ref(x, (2.0, 2.0), False)
++                self.assertEqual(out.dtype, mx.float32)
++                self.assertTrue(mx.allclose(out, ref, atol=1e-5))
++
++    def test_upsample_bilinear_grad(self):
++        scales = [(2.0, 2.0), (0.5, 0.5), (60.0, 60.0)]
++        for dev in self._upsample_devices():
++            with mx.stream(dev):
++                for scale in scales:
++                    if scale == (60.0, 60.0):
++                        x = mx.random.uniform(shape=(1, 1, 1, 512))
++                    else:
++                        x = mx.random.uniform(shape=(2, 7, 5, 4))
++                    out_h = int(scale[0] * x.shape[1])
++                    out_w = int(scale[1] * x.shape[2])
++                    y = mx.random.uniform(shape=(x.shape[0], out_h, out_w, x.shape[3]))
++
++                    def f_fast(x):
++                        return (mx.fast.upsample_bilinear(x, scale, False) * y).sum()
++
++                    def f_ref(x):
++                        return (_upsample_ref(x, scale, False) * y).sum()
++
++                    g_fast = mx.grad(f_fast)(x)
++                    g_ref = mx.grad(f_ref)(x)
++                    scale_atol = 1e-5 * max(1.0, float(mx.abs(g_ref).max()))
++                    self.assertTrue(mx.allclose(g_fast, g_ref, atol=scale_atol))
++
++    def test_upsample_bilinear_grad_float16(self):
++        for dev in self._upsample_devices():
++            with mx.stream(dev):
++                x = mx.random.uniform(shape=(2, 7, 5, 4)).astype(mx.float16)
++                y = mx.random.uniform(shape=(2, 14, 10, 4)).astype(mx.float16)
++
++                def f_fast(x):
++                    return (mx.fast.upsample_bilinear(x, (2.0, 2.0), False) * y).sum()
++
++                def f_ref(x):
++                    return (_upsample_ref(x, (2.0, 2.0), False) * y).sum()
++
++                g_fast = mx.grad(f_fast)(x)
++                g_ref = mx.grad(f_ref)(x)
++                self.assertTrue(
++                    mx.allclose(
++                        g_fast.astype(mx.float32),
++                        g_ref.astype(mx.float32),
++                        atol=1e-1,
++                    )
++                )
++
++    def test_upsample_bilinear_grad_align_corners(self):
++        for dev in self._upsample_devices():
++            with mx.stream(dev):
++                x = mx.random.uniform(shape=(2, 7, 5, 4))
++                y = mx.random.uniform(shape=(2, 14, 10, 4))
++
++                def f_fast(x):
++                    return (mx.fast.upsample_bilinear(x, (2.0, 2.0), True) * y).sum()
++
++                def f_ref(x):
++                    return (_upsample_ref(x, (2.0, 2.0), True) * y).sum()
++
++                g_fast = mx.grad(f_fast)(x)
++                g_ref = mx.grad(f_ref)(x)
++                scale_atol = 1e-5 * max(1.0, float(mx.abs(g_ref).max()))
++                self.assertTrue(mx.allclose(g_fast, g_ref, atol=scale_atol))
++
++    def test_upsample_bilinear_grad_float16_downscale(self):
++        for dev in self._upsample_devices():
++            with mx.stream(dev):
++                x = mx.random.uniform(shape=(2, 8, 6, 4)).astype(mx.float16)
++                y = mx.random.uniform(shape=(2, 4, 3, 4)).astype(mx.float16)
++
++                def f_fast(x):
++                    return (mx.fast.upsample_bilinear(x, (0.5, 0.5), False) * y).sum()
++
++                def f_ref(x):
++                    return (_upsample_ref(x, (0.5, 0.5), False) * y).sum()
++
++                g_fast = mx.grad(f_fast)(x)
++                g_ref = mx.grad(f_ref)(x)
++                self.assertTrue(
++                    mx.allclose(
++                        g_fast.astype(mx.float32),
++                        g_ref.astype(mx.float32),
++                        atol=1e-1,
++                    )
++                )
++
++    def test_upsample_bilinear_empty(self):
++        for dev in self._upsample_devices():
++            with mx.stream(dev):
++                # Zero-size batch.
++                x = mx.random.uniform(shape=(0, 7, 5, 4))
++                out = mx.fast.upsample_bilinear(x, (2.0, 2.0), False)
++                ref = _upsample_ref(x, (2.0, 2.0), False)
++                self.assertEqual(out.shape, ref.shape)
++                self.assertEqual(out.shape, (0, 14, 10, 4))
++
++                # A scale small enough to give an empty output on one axis.
++                x = mx.random.uniform(shape=(2, 4, 5, 4))
++                out = mx.fast.upsample_bilinear(x, (0.1, 2.0), False)
++                ref = _upsample_ref(x, (0.1, 2.0), False)
++                self.assertEqual(out.shape, ref.shape)
++                self.assertEqual(out.shape[1], 0)
++
++    def test_upsample_bilinear_vmap_jvp(self):
++        x = mx.random.uniform(shape=(3, 2, 7, 5, 4))
++
++        def f(x):
++            return mx.fast.upsample_bilinear(x, (2.0, 3.0), False)
++
++        def f_ref(x):
++            return _upsample_ref(x, (2.0, 3.0), False)
++
++        out = mx.vmap(f)(x)
++        ref = mx.vmap(f_ref)(x)
++        self.assertTrue(mx.allclose(out, ref, atol=1e-5))
++
++        x0 = x[0]
++        tangent = mx.random.uniform(shape=x0.shape)
++        _, jvp_out = mx.jvp(f, (x0,), (tangent,))
++        _, jvp_ref = mx.jvp(f_ref, (x0,), (tangent,))
++        self.assertTrue(mx.allclose(jvp_out[0], jvp_ref[0], atol=1e-5))
++
++    def test_upsample_bilinear_nn_layer_dtypes(self):
++        x = mx.random.uniform(shape=(2, 7, 5, 4)).astype(mx.float16)
++        layer = nn.Upsample(scale_factor=2.0, mode="linear")
++        out = layer(x)
++        ref = _upsample_ref(x, (2.0, 2.0), False)
++        self.assertEqual(out.dtype, mx.float16)
++        self.assertTrue(mx.allclose(out.astype(mx.float32), ref, atol=2e-2))
++
++        xi = mx.arange(2 * 4 * 4 * 2, dtype=mx.int32).reshape(2, 4, 4, 2)
++        out_i = nn.Upsample(scale_factor=2.0, mode="linear")(xi)
++        self.assertEqual(out_i.dtype, mx.float32)
++
++    def test_upsample_bilinear_noncontiguous(self):
++        for dev in self._upsample_devices():
++            with mx.stream(dev):
++                x = mx.random.uniform(shape=(2, 4, 7, 5))
++                xt = mx.transpose(x, (0, 2, 1, 3))
++                out = mx.fast.upsample_bilinear(xt, (2.0, 1.5), False)
++                ref = _upsample_ref(xt, (2.0, 1.5), False)
++                self.assertTrue(mx.allclose(out, ref, atol=1e-5))
++
++    def test_upsample_bilinear_compile(self):
++        x = mx.random.uniform(shape=(2, 7, 5, 4))
++
++        def f(x):
++            return mx.fast.upsample_bilinear(x, (2.0, 3.0), False)
++
++        out_eager = f(x)
++        out_compiled = mx.compile(f)(x)
++        self.assertTrue(mx.allclose(out_eager, out_compiled, atol=1e-6))
++
++    def test_upsample_bilinear_errors(self):
++        x = mx.random.uniform(shape=(2, 5, 4))
++        with self.assertRaises(ValueError):
++            mx.fast.upsample_bilinear(x, (2.0, 2.0))
++
+ 
+ if __name__ == "__main__":
+     mlx_tests.MLXTestRunner()
+diff --git a/mlx/backend/metal/kernels/upsample.metal b/mlx/backend/metal/kernels/upsample.metal
+new file mode 100644
+index 000000000..5bfaf0c89
+--- /dev/null
++++ b/mlx/backend/metal/kernels/upsample.metal
+@@ -0,0 +1,117 @@
++// Copyright © 2026 Apple Inc.
++
++#include <metal_stdlib>
++
++#include "mlx/backend/metal/kernels/utils.h"
++
++// Sizes are baked in as function constants so index math (div/mod/mul) is
++// resolved at pipeline-build time instead of costing a runtime op per thread.
++constant int C [[function_constant(0)]];
++constant int H_in [[function_constant(1)]];
++constant int W_in [[function_constant(2)]];
++constant int H_out [[function_constant(3)]];
++constant int W_out [[function_constant(4)]];
++
++// One thread per output value. y_l/y_r/x_l/x_r are each output index's
++// neighbour input indices, y_w/x_w the blend weight toward the right one.
++template <typename T>
++[[kernel]] void upsample_bilinear(
++    const device T* x [[buffer(0)]],
++    device T* out [[buffer(1)]],
++    const device uint* y_l [[buffer(2)]],
++    const device uint* y_r [[buffer(3)]],
++    const device float* y_w [[buffer(4)]],
++    const device uint* x_l [[buffer(5)]],
++    const device uint* x_r [[buffer(6)]],
++    const device float* x_w [[buffer(7)]],
++    uint3 pos [[thread_position_in_grid]]) {
++  uint c = pos.x;
++  uint ox = pos.y;
++  uint oy = pos.z % uint(H_out);
++  uint b = pos.z / uint(H_out);
++  if (c >= uint(C) || ox >= uint(W_out)) {
++    return;
++  }
++
++  uint y0 = y_l[oy], y1 = y_r[oy], x0 = x_l[ox], x1 = x_r[ox];
++  float ty = y_w[oy], tx = x_w[ox];
++
++  uint base = b * uint(H_in) * uint(W_in) * uint(C);
++  float q00 = static_cast<float>(x[base + (y0 * uint(W_in) + x0) * uint(C) + c]);
++  float q10 = static_cast<float>(x[base + (y0 * uint(W_in) + x1) * uint(C) + c]);
++  float q01 = static_cast<float>(x[base + (y1 * uint(W_in) + x0) * uint(C) + c]);
++  float q11 = static_cast<float>(x[base + (y1 * uint(W_in) + x1) * uint(C) + c]);
++
++  float r0 = (1 - tx) * q00 + tx * q10;
++  float r1 = (1 - tx) * q01 + tx * q11;
++  out[((b * uint(H_out) + oy) * uint(W_out) + ox) * uint(C) + c] =
++      static_cast<T>((1 - ty) * r0 + ty * r1);
++}
++
++// One thread per input value, gathering its share of every output index
++// that reads it (no atomics needed); y_lo/y_hi (x_lo/x_hi) give that range.
++template <typename T>
++[[kernel]] void upsample_bilinear_vjp(
++    const device T* g [[buffer(0)]],
++    device T* gx [[buffer(1)]],
++    const device uint* y_l [[buffer(2)]],
++    const device uint* y_r [[buffer(3)]],
++    const device float* y_w [[buffer(4)]],
++    const device uint* x_l [[buffer(5)]],
++    const device uint* x_r [[buffer(6)]],
++    const device float* x_w [[buffer(7)]],
++    const device uint* y_lo [[buffer(8)]],
++    const device uint* y_hi [[buffer(9)]],
++    const device uint* x_lo [[buffer(10)]],
++    const device uint* x_hi [[buffer(11)]],
++    uint3 pos [[thread_position_in_grid]]) {
++  uint c = pos.x;
++  uint ix = pos.y;
++  uint iy = pos.z % uint(H_in);
++  uint b = pos.z / uint(H_in);
++  if (c >= uint(C) || ix >= uint(W_in)) {
++    return;
++  }
++
++  uint y_lo_i = y_lo[iy], y_hi_i = y_hi[iy];
++  uint x_lo_i = x_lo[ix], x_hi_i = x_hi[ix];
++
++  uint base = b * uint(H_out) * uint(W_out) * uint(C);
++
++  float sum = 0;
++  for (uint oy = y_lo_i; oy < y_hi_i; oy++) {
++    // Hoist the y-axis weight out of the x loop: it does not depend on ox.
++    float ty = y_w[oy];
++    float wy = 0;
++    if (y_l[oy] == iy) {
++      wy += 1 - ty;
++    }
++    if (y_r[oy] == iy) {
++      wy += ty;
++    }
++    uint row = base + oy * uint(W_out) * uint(C);
++    for (uint ox = x_lo_i; ox < x_hi_i; ox++) {
++      float tx = x_w[ox];
++      float wx = 0;
++      if (x_l[ox] == ix) {
++        wx += 1 - tx;
++      }
++      if (x_r[ox] == ix) {
++        wx += tx;
++      }
++      sum += wy * wx * static_cast<float>(g[row + ox * uint(C) + c]);
++    }
++  }
++
++  gx[((b * uint(H_in) + iy) * uint(W_in) + ix) * uint(C) + c] =
++      static_cast<T>(sum);
++}
++
++// clang-format off
++#define instantiate_upsample_bilinear(name, type)           \
++  instantiate_kernel("upsample_bilinear_" #name, upsample_bilinear, type) \
++  instantiate_kernel("upsample_bilinear_vjp_" #name, upsample_bilinear_vjp, type)
++
++instantiate_upsample_bilinear(float16, half)
++instantiate_upsample_bilinear(bfloat16, bfloat16_t)
++instantiate_upsample_bilinear(float32, float) // clang-format on
+diff --git a/mlx/backend/metal/upsample.cpp b/mlx/backend/metal/upsample.cpp
+new file mode 100644
+index 000000000..fa8d4a647
+--- /dev/null
++++ b/mlx/backend/metal/upsample.cpp
+@@ -0,0 +1,235 @@
++// Copyright © 2026 Apple Inc.
++#include <algorithm>
++#include <cmath>
++
++#include "mlx/backend/gpu/copy.h"
++#include "mlx/backend/metal/device.h"
++#include "mlx/backend/metal/utils.h"
++#include "mlx/fast_primitives.h"
++
++namespace mlx::core::fast {
++
++namespace {
++
++array ensure_row_contiguous(
++    const array& x,
++    metal::CommandEncoder& encoder,
++    const Stream& s) {
++  if (x.flags().row_contiguous) {
++    return x;
++  }
++  array x_copy = contiguous_copy_gpu(x, s);
++  encoder.add_temporary(x_copy);
++  return x_copy;
++}
++
++// Sizes are passed as function constants so the kernel bakes them in as
++// compile-time constants; hash_name keys the pipeline cache per shape.
++MTL::ComputePipelineState* get_upsample_kernel(
++    metal::Device& d,
++    const std::string& base_name,
++    int C,
++    int H_in,
++    int W_in,
++    int H_out,
++    int W_out) {
++  metal::MTLFCList func_consts = {
++      {&C, MTL::DataType::DataTypeInt, 0},
++      {&H_in, MTL::DataType::DataTypeInt, 1},
++      {&W_in, MTL::DataType::DataTypeInt, 2},
++      {&H_out, MTL::DataType::DataTypeInt, 3},
++      {&W_out, MTL::DataType::DataTypeInt, 4},
++  };
++  std::string hash_name;
++  hash_name.reserve(64);
++  concatenate(
++      hash_name,
++      base_name,
++      "_C_",
++      C,
++      "_Hi_",
++      H_in,
++      "_Wi_",
++      W_in,
++      "_Ho_",
++      H_out,
++      "_Wo_",
++      W_out);
++  return d.get_kernel(base_name, hash_name, func_consts);
++}
++
++array make_host_array(Shape shape, Dtype dtype) {
++  array a(std::move(shape), dtype, nullptr, {});
++  a.set_data(allocator::malloc(a.nbytes()));
++  return a;
++}
++
++// Per output index o: its two neighbour input indices l(o)/r(o) and the
++// blend weight toward r(o). Matches the CPU fallback's float32 arithmetic.
++struct AxisTables {
++  array l;
++  array r;
++  array w;
++};
++
++AxisTables build_axis_tables(int N, int M, float step, float start) {
++  AxisTables t{
++      make_host_array({M}, uint32),
++      make_host_array({M}, uint32),
++      make_host_array({M}, float32)};
++  auto* lp = t.l.data<uint32_t>();
++  auto* rp = t.r.data<uint32_t>();
++  auto* wp = t.w.data<float>();
++  for (int o = 0; o < M; ++o) {
++    float src = static_cast<float>(o) * step;
++    src = src - start;
++    src = std::clamp(src, 0.0f, static_cast<float>(N - 1));
++    float l = std::floor(src);
++    float r = std::ceil(src);
++    lp[o] = static_cast<uint32_t>(l);
++    rp[o] = static_cast<uint32_t>(r);
++    wp[o] = src - l;
++  }
++  return t;
++}
++
++// Per input index i: the half-open range [lo(i), hi(i)) of output indices
++// that read it, found with a two-pointer sweep over l and r (O(N + M)).
++struct RangeTables {
++  array lo;
++  array hi;
++};
++
++RangeTables
++build_range_tables(int N, int M, const uint32_t* l, const uint32_t* r) {
++  RangeTables t{make_host_array({N}, uint32), make_host_array({N}, uint32)};
++  auto* lop = t.lo.data<uint32_t>();
++  auto* hip = t.hi.data<uint32_t>();
++  int o = 0;
++  for (int i = 0; i < N; ++i) {
++    while (o < M && r[o] < static_cast<uint32_t>(i)) {
++      ++o;
++    }
++    lop[i] = o;
++  }
++  o = 0;
++  for (int i = 0; i < N; ++i) {
++    while (o < M && l[o] <= static_cast<uint32_t>(i)) {
++      ++o;
++    }
++    hip[i] = o;
++  }
++  return t;
++}
++
++} // namespace
++
++bool UpsampleBilinear::use_fallback(Stream s) {
++  return s.device == Device::cpu;
++}
++
++void UpsampleBilinear::eval_gpu(
++    const std::vector<array>& inputs,
++    std::vector<array>& outputs) {
++  assert(inputs.size() == 1);
++  auto& out = outputs[0];
++  auto& s = stream();
++  auto& d = metal::device(s.device);
++  auto& compute_encoder = metal::get_command_encoder(s);
++
++  auto in = ensure_row_contiguous(inputs[0], compute_encoder, s);
++  out.set_data(allocator::malloc(out.nbytes()));
++
++  int B = in.shape(0);
++  int H_in = in.shape(1);
++  int W_in = in.shape(2);
++  int C = in.shape(3);
++  int H_out = out_h_;
++  int W_out = out_w_;
++
++  auto y = build_axis_tables(H_in, H_out, step_h_, start_h_);
++  auto x = build_axis_tables(W_in, W_out, step_w_, start_w_);
++
++  auto kernel = get_upsample_kernel(
++      d, "upsample_bilinear_" + type_to_name(in), C, H_in, W_in, H_out, W_out);
++  compute_encoder.set_compute_pipeline_state(kernel);
++  compute_encoder.set_input_array(in, 0);
++  compute_encoder.set_output_array(out, 1);
++  compute_encoder.set_input_array(y.l, 2);
++  compute_encoder.set_input_array(y.r, 3);
++  compute_encoder.set_input_array(y.w, 4);
++  compute_encoder.set_input_array(x.l, 5);
++  compute_encoder.set_input_array(x.r, 6);
++  compute_encoder.set_input_array(x.w, 7);
++  compute_encoder.add_temporaries({y.l, y.r, y.w, x.l, x.r, x.w});
++
++  MTL::Size group_dims(std::min(C, 32), 8, 1);
++  MTL::Size grid_dims(C, W_out, B * H_out);
++  compute_encoder.dispatch_threads(grid_dims, group_dims);
++}
++
++void UpsampleBilinearVJP::eval_gpu(
++    const std::vector<array>& inputs,
++    std::vector<array>& outputs) {
++  assert(inputs.size() == 1);
++  auto& out = outputs[0];
++  auto& s = stream();
++  auto& d = metal::device(s.device);
++  auto& compute_encoder = metal::get_command_encoder(s);
++
++  auto g = ensure_row_contiguous(inputs[0], compute_encoder, s);
++  out.set_data(allocator::malloc(out.nbytes()));
++
++  int B = g.shape(0);
++  int H_out = g.shape(1);
++  int W_out = g.shape(2);
++  int C = g.shape(3);
++  int H_in = in_h_;
++  int W_in = in_w_;
++
++  auto y = build_axis_tables(H_in, H_out, step_h_, start_h_);
++  auto x = build_axis_tables(W_in, W_out, step_w_, start_w_);
++  auto y_range = build_range_tables(
++      H_in, H_out, y.l.data<uint32_t>(), y.r.data<uint32_t>());
++  auto x_range = build_range_tables(
++      W_in, W_out, x.l.data<uint32_t>(), x.r.data<uint32_t>());
++
++  auto kernel = get_upsample_kernel(
++      d,
++      "upsample_bilinear_vjp_" + type_to_name(g),
++      C,
++      H_in,
++      W_in,
++      H_out,
++      W_out);
++  compute_encoder.set_compute_pipeline_state(kernel);
++  compute_encoder.set_input_array(g, 0);
++  compute_encoder.set_output_array(out, 1);
++  compute_encoder.set_input_array(y.l, 2);
++  compute_encoder.set_input_array(y.r, 3);
++  compute_encoder.set_input_array(y.w, 4);
++  compute_encoder.set_input_array(x.l, 5);
++  compute_encoder.set_input_array(x.r, 6);
++  compute_encoder.set_input_array(x.w, 7);
++  compute_encoder.set_input_array(y_range.lo, 8);
++  compute_encoder.set_input_array(y_range.hi, 9);
++  compute_encoder.set_input_array(x_range.lo, 10);
++  compute_encoder.set_input_array(x_range.hi, 11);
++  compute_encoder.add_temporaries(
++      {y.l,
++       y.r,
++       y.w,
++       x.l,
++       x.r,
++       x.w,
++       y_range.lo,
++       y_range.hi,
++       x_range.lo,
++       x_range.hi});
++
++  MTL::Size group_dims(std::min(C, 32), 8, 1);
++  MTL::Size grid_dims(C, W_in, B * H_in);
++  compute_encoder.dispatch_threads(grid_dims, group_dims);
++}
++
++} // namespace mlx::core::fast

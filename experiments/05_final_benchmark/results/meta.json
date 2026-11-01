@@ -1,0 +1,22 @@
+{
+  "envs": {
+    "stock": {
+      "chip": "Apple M1",
+      "macos": "27.2",
+      "mlx": "0.32.4",
+      "python": "3.12.15",
+      "git_commit": "477a4dab5dd6b1e794a5f393a89dbdef141415fa",
+      "timestamp": "2026-10-26T16:50:03.006271+00:00"
+    },
+    "fused_cpp": {
+      "chip": "Apple M1",
+      "macos": "27.2",
+      "mlx": "0.32.4.dev20261026+36969c094",
+      "python": "3.12.15",
+      "git_commit": "477a4dab5dd6b1e794a5f393a89dbdef141415fa",
+      "timestamp": "2026-10-26T16:50:03.242458+00:00"
+    }
+  },
+  "mlx_repo_commit": "36969c094354086e15d2a327a9c50feb20b9cf11",
+  "mlx_repo_dirty": true
+}
