@@ -22,6 +22,7 @@ ceiling for this output size, independent of any upsampling math.
 import argparse
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 import matplotlib
@@ -160,14 +161,83 @@ def run_config(cfg: dict, path: Path, done: set) -> None:
     mx.clear_cache()
 
 
+def load_wide(path: Path) -> pd.DataFrame:
+    df = pd.read_json(path, lines=True, dtype=False)
+    wide = df.pivot_table(index=["scale", "row_bytes", "H", "W"], columns="variant", values=["ms_median", "gbs"]).reset_index()
+    wide.columns = ["_".join(c).rstrip("_") if c[1] else c[0] for c in wide.columns]
+    return wide.sort_values(["scale", "row_bytes"])
+
+
+def plot_rowsize(
+    wide: pd.DataFrame,
+    out_path: Path,
+    col_width: float = 6,
+    height: float = 4.5,
+    dpi: int = 130,
+    fontsize: float | None = None,
+    top_margin: float | None = None,
+    wspace: float | None = None,
+    bbox_inches: str | None = "tight",
+    constrained_layout: bool = False,
+    suptitle: str | None = "Effective bandwidth vs. input row size (output fixed at 128 MiB)",
+    shared_legend: bool = False,
+    legend_ncol: int = 3,
+    legend_fontsize: float | None = None,
+    legend_loc: str = "lower center",
+    legend_bbox_to_anchor: tuple = (0.5, 0.0),
+    bottom_margin: float | None = None,
+    sharey: bool = False,
+    xlabel: str = "row_bytes (W_in * C * 4)",
+    shared_xlabel: bool = False,
+    xlabel_y: float = 0.0,
+) -> None:
+    ctx = plt.rc_context({"font.size": fontsize}) if fontsize is not None else nullcontext()
+    with ctx:
+        scales = sorted(wide.scale.unique())
+        fig, axes = plt.subplots(
+            1, len(scales), figsize=(col_width * len(scales), height), squeeze=False,
+            constrained_layout=constrained_layout, sharey=sharey,
+        )
+        for k, (ax, scale) in enumerate(zip(axes[0], scales)):
+            g = wide[wide.scale == scale].sort_values("row_bytes")
+            for v in ("fused", "fused_tiled", "copy"):
+                col = f"gbs_{v}"
+                if col in g:
+                    ax.plot(g.row_bytes, g[col], marker="o", label=v)
+            ax.set_xscale("log")
+            if not shared_xlabel:
+                ax.set_xlabel(xlabel)
+            if not sharey or k == 0:
+                ax.set_ylabel("GB/s")
+            else:
+                ax.tick_params(axis="y", labelleft=False)
+            ax.set_title(f"scale={scale}")
+            if not shared_legend:
+                ax.legend()
+        if shared_xlabel:
+            fig.supxlabel(xlabel, y=xlabel_y)
+        if shared_legend:
+            handles, labels = axes[0, 0].get_legend_handles_labels()
+            fig.legend(handles, labels, loc=legend_loc, ncol=legend_ncol, fontsize=legend_fontsize, bbox_to_anchor=legend_bbox_to_anchor)
+        if suptitle:
+            fig.suptitle(suptitle)
+        if not constrained_layout:
+            if top_margin is not None:
+                fig.subplots_adjust(top=1 - top_margin)
+            if bottom_margin is not None:
+                fig.subplots_adjust(bottom=bottom_margin)
+            if wspace is not None:
+                fig.subplots_adjust(wspace=wspace)
+        fig.savefig(out_path, dpi=dpi, bbox_inches=bbox_inches)
+        plt.close(fig)
+
+
 def analyze(path: Path) -> None:
     out_dir = path.parent
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     df = pd.read_json(path, lines=True, dtype=False)
-    wide = df.pivot_table(index=["scale", "row_bytes", "H", "W"], columns="variant", values=["ms_median", "gbs"]).reset_index()
-    wide.columns = ["_".join(c).rstrip("_") if c[1] else c[0] for c in wide.columns]
-    wide = wide.sort_values(["scale", "row_bytes"])
+    wide = load_wide(path)
 
     lines = ["# Row-size summary\n", f"Source: `{path.name}`\n",
               "Tests whether `fused` only re-reads input from DRAM once one input row "
@@ -194,22 +264,7 @@ def analyze(path: Path) -> None:
     lines.append(f"\nMax abs diff, fused vs fused_tiled, across all configs: {maxdiff:.2e}\n")
     (out_dir / "rowsize_summary.md").write_text("\n".join(lines) + "\n")
 
-    scales = sorted(wide.scale.unique())
-    fig, axes = plt.subplots(1, len(scales), figsize=(6 * len(scales), 4.5), squeeze=False)
-    for ax, scale in zip(axes[0], scales):
-        g = wide[wide.scale == scale].sort_values("row_bytes")
-        for v in ("fused", "fused_tiled", "copy"):
-            col = f"gbs_{v}"
-            if col in g:
-                ax.plot(g.row_bytes, g[col], marker="o", label=v)
-        ax.set_xscale("log")
-        ax.set_xlabel("row_bytes (W_in * C * 4)")
-        ax.set_ylabel("GB/s")
-        ax.set_title(f"scale={scale}")
-        ax.legend()
-    fig.suptitle("Effective bandwidth vs. input row size (output fixed at 128 MiB)")
-    fig.savefig(fig_dir / "rowsize.png", dpi=130, bbox_inches="tight")
-    plt.close(fig)
+    plot_rowsize(wide, fig_dir / "rowsize.png")
     print(f"wrote {out_dir / 'rowsize_summary.md'} and {fig_dir / 'rowsize.png'}")
 
 

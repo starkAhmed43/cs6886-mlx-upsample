@@ -2,6 +2,7 @@
 
 import argparse
 import json
+from contextlib import nullcontext
 from pathlib import Path
 
 import matplotlib
@@ -57,30 +58,56 @@ def crossover(g: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
-def heatmaps(g: pd.DataFrame, fig_dir: Path) -> None:
-    g = g.dropna(subset=["gather", "matmul"]).assign(l2=lambda d: np.log2(d.gather / d.matmul))
-    hs = sorted(g.H.unique())
-    for (p, d), grp in g.groupby(["pass", "dtype"]):
-        cs = sorted(grp.C.unique())
-        fig, axes = plt.subplots(1, len(cs), figsize=(5.5 * len(cs), 4), squeeze=False)
-        lim = max(1.0, np.abs(grp.l2).max())
-        for ax, c in zip(axes[0], cs):
-            t = grp[grp.C == c].pivot(index="scale", columns="H", values="l2").reindex(columns=hs)
-            im = ax.imshow(t.to_numpy(), cmap="RdBu", norm=TwoSlopeNorm(0, -lim, lim), aspect="auto", origin="lower")
-            for (i, j), v in np.ndenumerate(t.to_numpy()):
-                if not np.isnan(v):
-                    ax.text(j, i, f"{2 ** v:.1f}", ha="center", va="center", fontsize=6)
-            ax.set_xticks(range(len(hs)), hs, rotation=90)
-            ax.set_yticks(range(len(t)), t.index)
-            ax.set_title(f"C={c}")
-            ax.set_xlabel("H = W")
-            if 128 in hs:
-                ax.axvline(hs.index(128) + 0.5, color="k", ls="--", lw=1)
-        axes[0, 0].set_ylabel("scale")
-        fig.colorbar(im, ax=axes[0], label="log2(gather / matmul)  (blue: matmul faster, red: gather faster)")
-        fig.suptitle(f"{p}, {d}; dashed line: PR #4418 limit (128)")
-        fig.savefig(fig_dir / f"heatmap_{p}_{d}.png", dpi=130, bbox_inches="tight")
-        plt.close(fig)
+def heatmaps(
+    g: pd.DataFrame,
+    fig_dir: Path,
+    col_width: float = 5.5,
+    height: float = 4,
+    dpi: int = 130,
+    cell_fontsize: float = 6,
+    fontsize: float | None = None,
+    show_cell_numbers: bool = True,
+    top_margin: float | None = None,
+    wspace: float | None = None,
+    cbar_label: str = "log2(gather / matmul)  (blue: matmul faster, red: gather faster)",
+    cbar_fraction: float = 0.15,
+    cbar_pad: float = 0.05,
+    bbox_inches: str | None = "tight",
+    constrained_layout: bool = False,
+) -> None:
+    ctx = plt.rc_context({"font.size": fontsize}) if fontsize is not None else nullcontext()
+    with ctx:
+        g = g.dropna(subset=["gather", "matmul"]).assign(l2=lambda d: np.log2(d.gather / d.matmul))
+        hs = sorted(g.H.unique())
+        for (p, d), grp in g.groupby(["pass", "dtype"]):
+            cs = sorted(grp.C.unique())
+            fig, axes = plt.subplots(
+                1, len(cs), figsize=(col_width * len(cs), height), squeeze=False, constrained_layout=constrained_layout
+            )
+            lim = max(1.0, np.abs(grp.l2).max())
+            for ax, c in zip(axes[0], cs):
+                t = grp[grp.C == c].pivot(index="scale", columns="H", values="l2").reindex(columns=hs)
+                im = ax.imshow(t.to_numpy(), cmap="RdBu", norm=TwoSlopeNorm(0, -lim, lim), aspect="auto", origin="lower")
+                if show_cell_numbers:
+                    for (i, j), v in np.ndenumerate(t.to_numpy()):
+                        if not np.isnan(v):
+                            ax.text(j, i, f"{2 ** v:.1f}", ha="center", va="center", fontsize=cell_fontsize)
+                ax.set_xticks(range(len(hs)), hs, rotation=90)
+                ax.set_yticks(range(len(t)), t.index)
+                ax.set_title(f"C={c}")
+                ax.set_xlabel("H = W")
+                if 128 in hs:
+                    ax.axvline(hs.index(128) + 0.5, color="k", ls="--", lw=1)
+            axes[0, 0].set_ylabel("scale")
+            fig.colorbar(im, ax=axes[0], label=cbar_label, fraction=cbar_fraction, pad=cbar_pad)
+            fig.suptitle(f"{p}, {d}; dashed line: PR #4418 limit (128)")
+            if not constrained_layout:
+                if top_margin is not None:
+                    fig.subplots_adjust(top=1 - top_margin)
+                if wspace is not None:
+                    fig.subplots_adjust(wspace=wspace)
+            fig.savefig(fig_dir / f"heatmap_{p}_{d}.png", dpi=dpi, bbox_inches=bbox_inches)
+            plt.close(fig)
 
 
 def compile_effect(g: pd.DataFrame, fig_dir: Path) -> None:
@@ -202,6 +229,19 @@ def candidate_rule(co: pd.DataFrame) -> str:
     return md(t)
 
 
+def load_wide(path: Path) -> tuple[pd.DataFrame, pd.DataFrame, int]:
+    """Read `sweep.jsonl`, check row uniqueness, and pivot to one row per workload+variant."""
+    df = pd.read_json(path, lines=True, dtype=False)
+    check_unique(df)
+    valid = df[df.valid == True]  # noqa: E712
+    n_bad = len(df) - len(valid)
+    wide = valid.pivot_table(index=WORKLOAD, columns="variant", values="ms_median").reset_index()
+    for v in ["gather", *OTHERS]:
+        if v not in wide:
+            wide[v] = np.nan
+    return df, wide, n_bad
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="inp", type=Path, default=RESULTS / "sweep.jsonl")
@@ -210,15 +250,8 @@ def main():
     fig_dir = out / "figures"
     fig_dir.mkdir(exist_ok=True)
 
-    df = pd.read_json(args.inp, lines=True, dtype=False)
-    check_unique(df)
-    valid = df[df.valid == True]  # noqa: E712
-    n_bad = len(df) - len(valid)
+    df, wide, n_bad = load_wide(args.inp)
     print(f"{len(df)} rows, dropped {n_bad} invalid")
-    wide = valid.pivot_table(index=WORKLOAD, columns="variant", values="ms_median").reset_index()
-    for v in ["gather", *OTHERS]:
-        if v not in wide:
-            wide[v] = np.nan
     grid_w, real_w = wide[wide.set == "grid"], wide[wide.set == "real"]
 
     co = crossover(grid_w)

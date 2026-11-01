@@ -13,6 +13,7 @@ dev = ["pytest"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["mlx_upsample*"]
 
 [tool.setuptools.package-data]
 mlx_upsample = ["kernels/*.metal"]
