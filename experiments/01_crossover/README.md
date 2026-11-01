@@ -39,6 +39,7 @@ python experiments/01_crossover/sweep.py                # full sweep, results/sw
 python experiments/01_crossover/analyze.py              # crossover.csv, figures/, gate_regret.csv, summary.md
 python experiments/01_crossover/confirm.py              # 10 fresh processes per key, results/confirm.jsonl
 python experiments/01_crossover/analyze.py --in experiments/01_crossover/results/scratch/sweep.jsonl
+python experiments/01_crossover/roofline.py              # results/roofline.csv, figures/roofline.png (no new timing)
 ```
 
 `sweep.py` options: `--set grid|real|all`, `--pass fwd|fwd_bwd|both`, `--out PATH`.
@@ -115,3 +116,22 @@ This is a candidate. The data does not show how it performs on other chips.
 - The DeepLabV3+, PSPNet and RIFE shapes are not verified against configs.
 - Training rows use float32 and inference rows use float16, so dtype and batch size are mixed.
 - Compile covers the forward pass only.
+
+## Roofline
+
+`roofline.py` builds a roofline model from `results/sweep.jsonl`, with no new timing (M1: 68.25
+GB/s, 2.6 TFLOP/s; see `mlx_upsample.roofline` for the full model). All 4 variants upcast their
+output to float32, so bytes use the same minimum-traffic rule for every row. FLOPs differ by
+method: `gather`/`gather_compiled` always use the elementwise bilinear count (9
+flops/output-element/pass); `matmul` always uses the dense per-axis matmul count (it bypasses PR
+#4418's gate); `pr4418` uses whichever count its own gate (`uses_matmul`) would pick for that
+shape. This is the point of this roofline: for the same output, matmul does far more arithmetic,
+so it reaches much higher achieved GFLOP/s without reaching higher achieved GB/s than gather.
+
+Arithmetic intensity ranges 0.205-1707 FLOP/byte (ridge point 38.1). Median `frac_of_peak_bw` by
+variant and pass: gather 1.9-2.2%, gather_compiled 2.2-3.1%, matmul 5.0-6.6%, pr4418 2.6-3.1%. The
+best variant (matmul) peaks at 44.4% of peak bandwidth. No row exceeds 100% of peak bandwidth
+(3216 rows, 5 dropped as invalid, same OOM failures `analyze.py` reports). The plot's left panel
+shows matmul and the matmul-gated `pr4418` rows sitting at far higher arithmetic intensity and
+achieved GFLOP/s than gather at the same achieved bandwidth, confirming the extra-arithmetic
+explanation for matmul's wall-clock win. See `results/figures/roofline.png`.

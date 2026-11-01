@@ -54,6 +54,7 @@ python experiments/02_fused_kernel/check.py           # full grid + real catalog
 python experiments/02_fused_kernel/sweep.py --smoke     # about 40 rows, writes results/scratch/
 python experiments/02_fused_kernel/sweep.py              # full grid + real catalog, results/sweep.jsonl
 python experiments/02_fused_kernel/analyze.py            # reads results/sweep.jsonl by default
+python experiments/02_fused_kernel/roofline.py            # results/roofline.csv, figures/roofline.png (no new timing)
 ```
 
 `sweep.py` writes `results/sweep.jsonl` and `results/meta.json`, and is resumable: a second run
@@ -100,6 +101,22 @@ with several small MLX ops on every call, and this setup cost may be that fixed 
 
 See `results/figures/heatmap_fwd_float32.png`, `results/figures/heatmap_fwd_float16.png`, and
 `results/figures/real_workloads.png` for the full picture.
+
+## Roofline
+
+`roofline.py` builds a roofline model from `results/sweep.jsonl`, with no new timing (M1: 68.25
+GB/s, 2.6 TFLOP/s; see `mlx_upsample.roofline`). All 5 variants, including `fused`, upcast their
+output to float32 for a float16 input (confirmed above: "the same as stock"), so bytes use the
+same minimum-traffic rule for every row. `fused` is an elementwise bilinear kernel (9
+flops/output-element, same model as `gather`); `matmul` always uses the dense per-axis matmul
+count, and `pr4418` uses it only where its own gate picks that path.
+
+Arithmetic intensity ranges 0.45-1707 FLOP/byte (ridge point 38.1). Median `frac_of_peak_bw`:
+gather 1.9%, gather_compiled 3.1%, matmul 4.5%, pr4418 2.5%, fused 24.4%. `fused` peaks at 86.1%
+of peak bandwidth, the highest of any variant in this repo's roofline analyses. No row exceeds
+100% of peak bandwidth (2010 rows, 0 invalid). The bandwidth-utilization panel shows `fused`
+clearly separated above the other variants, consistent with the forward-only speedup this
+experiment measures directly. See `results/figures/roofline.png`.
 
 ## Fixed-cost check
 

@@ -41,6 +41,7 @@ python experiments/04_backward/sweep.py             # full grid + real catalog, 
 python experiments/04_backward/analyze.py           # reads results/sweep.jsonl by default
 python experiments/04_backward/analyze.py --in experiments/04_backward/results/scratch/sweep.jsonl --out-dir experiments/04_backward/results/scratch
 python experiments/04_backward/retime.py            # re-times the 2 losses in isolation, writes results/retime.jsonl
+python experiments/04_backward/roofline.py          # results/roofline.csv, figures/roofline.png (no new timing)
 ```
 
 `sweep.py` writes `results/sweep.jsonl` and `results/meta.json`, and is resumable: a second run
@@ -131,3 +132,24 @@ output cap and still exhaust memory on the input and its gradient.
 - Both the fused forward and backward kernels use cached lookup tables keyed by shape; the
   first call for a new shape pays the cost of building that table.
 - The kernel uses 32-bit indexing, so it is not validated on tensors needing 64-bit offsets.
+
+## Roofline
+
+`roofline.py` builds a roofline model from `results/sweep.jsonl` (forward+backward rows only),
+with no new timing (M1: 68.25 GB/s, 2.6 TFLOP/s; see `mlx_upsample.roofline`). All 4 variants
+upcast their forward output to float32 (`fused`'s forward kernel is the same `_launch` as
+`02_fused_kernel`); the grad-input write always uses the input dtype's size for every variant,
+including `fused`, whose backward kernel casts to the input dtype. `fused`'s backward is a
+hand-written gather-style accumulation, so it uses the elementwise FLOPs model throughout.
+`matmul` is called directly (bypassing PR #4418's upscale-only gate), so it always gets the dense
+matmul count, including for downscale rows; `pr4418` gets that count only where its own gate
+picks the matmul path, so most of its downscale rows use the elementwise count instead.
+
+Arithmetic intensity ranges 0.205-1396 FLOP/byte (ridge point 38.1). Median `frac_of_peak_bw`:
+gather 2.1%, matmul 6.5%, pr4418 3.4%, fused 34.6%. `fused` peaks at 79.9% of peak bandwidth. No
+row exceeds 100% of peak bandwidth (1524 rows, 5 dropped as invalid -- the same `grid.h2048.s0.25.c256`
+OOM failures `analyze.py` reports). The bandwidth-utilization panel shows `fused` well above
+`gather`, `matmul` and `pr4418`, consistent with the forward+backward speedup this experiment
+measures directly, and larger than `02_fused_kernel`'s forward-only gap -- matching this README's
+earlier point that stock MLX pays extra cost differentiating through gather/matmul, which `fused`
+avoids with a single hand-written backward pass. See `results/figures/roofline.png`.
