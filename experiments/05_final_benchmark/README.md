@@ -14,8 +14,9 @@ Three implementations:
 - **pr4418**: `mlx_upsample.variants.pr4418_shipped`, the PR as shipped, same env as stock. Stock
   MLX does not include the PR, so this variant calls the PR's code directly.
 - **fused_cpp**: `nn.Upsample` in the from-source mlx env (`cs6886-mlx-dev`, branch
-  `upsample-fused` of `~/GitHub/mlx`). In this env, `nn.Upsample`'s linear path for 4-D inputs
-  dispatches to `mx.fast.upsample_bilinear`, a C++/Metal primitive with a differentiable VJP.
+  [`upsample-fused`](https://github.com/starkAhmed43/mlx/tree/upsample-fused)). In this env,
+  `nn.Upsample`'s linear path for 4-D inputs dispatches to `mx.fast.upsample_bilinear`, a
+  C++/Metal primitive with a differentiable VJP.
 
 ## Method
 
@@ -47,13 +48,15 @@ Three implementations:
 ## How to run
 
 Run from the repo root with the `cs6886-mlx-upsample` env's python (the orchestrator calls out to
-`cs6886-mlx-dev`'s python itself for the `fused_cpp` rows):
+`cs6886-mlx-dev`'s python itself for the `fused_cpp` rows). `run.py` finds both conda envs by
+name; set `STOCK_PY`, `DEV_PY`, or `MLX_REPO` to override them if your setup differs:
 
 ```sh
 python experiments/05_final_benchmark/run.py --smoke   # 3 small workloads x 2 runs, results/scratch/
 python experiments/05_final_benchmark/run.py            # full catalog x 10 runs, results/runs.jsonl
 python experiments/05_final_benchmark/analyze.py --smoke
 python experiments/05_final_benchmark/analyze.py        # reads results/runs.jsonl by default
+python experiments/05_final_benchmark/roofline.py        # reads results/table.csv, no new timing
 ```
 
 `run.py` writes `results/runs.jsonl` and `results/meta.json` (environment metadata for both envs,
@@ -144,3 +147,27 @@ the lowest forward+backward speedups vs pr4418, between 1.16x and 1.30x.
 - Measured on one machine only: Apple M1, 16 GB, macOS 27.2.
 
 See `results/figures/speedup.png` for the full distribution.
+
+### Roofline
+
+`roofline.py` reuses `results/table.csv` (no new timing) to build `results/roofline.csv` (one row
+per name/B/dtype/pass/variant) and `results/figures/roofline.png`. The hardware model is Apple M1
+8-core GPU peaks: 68.25 GB/s DRAM bandwidth, 2.6 TFLOP/s fp32 compute (ridge point
+2600/68.25 ≈ 38.1 FLOP/byte). Minimum bytes moved use each variant's real output dtype (`fused_cpp`
+keeps float16 output for float16 input; `stock` and `pr4418` upcast output to float32 — see the
+dtype table above): `fwd` is input read once + output written once, where the input read is capped
+at `min(H, 2·oh) · min(W, 2·ow)` pixels per (batch, channel) for downscaling workloads, since a
+correct bilinear kernel touches at most 2 input indices per output index per axis (cache-line
+granularity is ignored); `fwd_bwd` adds grad-output read once and grad-input written once, the
+latter over the full input shape (every input position gets a gradient). FLOPs use 9 flops per
+output element per pass (3 lerps × 3 flops), the same for all variants, since the algorithm is
+identical; only achieved GFLOP/s and GB/s differ by variant.
+
+Every row sits far to the left of the ridge point: arithmetic intensity ranges from 0.21 to 4.5
+FLOP/byte, about an order of magnitude below 38.1, so the workload is memory-bound, not
+compute-bound, for all three variants. Median achieved bandwidth as a fraction of the 68.25 GB/s
+peak: `stock` 3.4% (fwd) / 3.3% (fwd_bwd), `pr4418` 13.6% / 13.2%, `fused_cpp` 45.1% / 32.4%. No
+row exceeds the modeled peak (max is `fused_cpp` at 75.3%, on `rife.down2`, B=8, float32, forward).
+The gap between variants at the same arithmetic intensity is wasted memory traffic in
+`stock`/`pr4418` beyond the modeled minimum (extra kernel launches, intermediate buffers, or
+re-reads), not a difference in algorithmic work.
