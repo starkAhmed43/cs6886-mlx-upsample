@@ -12,6 +12,7 @@ Rows are appended to results/runs.jsonl as they complete, so a crash only loses 
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from dataclasses import asdict
@@ -22,15 +23,49 @@ from mlx_upsample.workloads import Workload, out_bytes, real
 
 RESULTS = Path(__file__).parent / "results"
 PASSES = ("fwd", "fwd_bwd")
-MLX_REPO = Path.home() / "GitHub/mlx"
+MLX_REPO = Path(os.environ.get("MLX_REPO", Path.home() / "GitHub/mlx"))
 
-STOCK_PY = "/Users/adhilahmed/miniconda3/envs/cs6886-mlx-upsample/bin/python"
-DEV_PY = "/Users/adhilahmed/miniconda3/envs/cs6886-mlx-dev/bin/python"
+
+def _conda_python(env: str) -> str:
+    """Find env's python via `conda info --base`, falling back to CONDA_EXE/CONDA_PREFIX."""
+    try:
+        base = subprocess.run(
+            ["conda", "info", "--base"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        conda_exe = os.environ.get("CONDA_EXE")
+        base = str(Path(conda_exe).parent.parent) if conda_exe else None
+        if base is None:
+            prefix = os.environ.get("CONDA_PREFIX")
+            base = str(Path(prefix).parent.parent) if prefix else None
+    if base is None:
+        raise RuntimeError(
+            f"Could not locate conda to resolve env {env!r}. Set STOCK_PY/DEV_PY explicitly."
+        )
+    return str(Path(base) / "envs" / env / "bin" / "python")
+
+
+def _resolve_py(env_var: str, env_name: str) -> str:
+    py = os.environ.get(env_var) or _conda_python(env_name)
+    if not Path(py).exists():
+        raise RuntimeError(
+            f"No python found at {py!r} for conda env {env_name!r}. "
+            f"Set the {env_var} environment variable to the right python."
+        )
+    return py
+
+
 ENVS = {
-    "stock": {"python": STOCK_PY, "variants": ["stock", "pr4418"]},
-    "fused_cpp": {"python": DEV_PY, "variants": ["fused_cpp"]},
+    "stock": {"variants": ["stock", "pr4418"]},
+    "fused_cpp": {"variants": ["fused_cpp"]},
 }
 SMOKE_NAMES = {"pspnet.bin1", "segformer_b0.mlp16", "upernet.fpn16"}
+
+
+def _resolve_envs() -> None:
+    """Resolve each env's python lazily, so `--help` works without the conda envs existing."""
+    ENVS["stock"]["python"] = _resolve_py("STOCK_PY", "cs6886-mlx-upsample")
+    ENVS["fused_cpp"]["python"] = _resolve_py("DEV_PY", "cs6886-mlx-dev")
 
 
 class RunStore(ResultStore):
@@ -162,6 +197,7 @@ def main():
     if args.one:
         return one(json.loads(args.one))
 
+    _resolve_envs()
     runs = 2 if args.smoke else args.runs
     out = RESULTS / ("scratch/runs.jsonl" if args.smoke else "runs.jsonl")
     store = RunStore(out)
