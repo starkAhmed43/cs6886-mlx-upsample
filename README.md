@@ -22,7 +22,7 @@ Run `python src/report/make_figures.py` to regenerate its three figures from the
   (separate repo): the fused kernel as an MLX C++ primitive, `mx.fast.upsample_bilinear`.
   Experiment 05 uses it. The exact diff is
   `experiments/05_final_benchmark/results/mlx_uncommitted.patch`.
-  Upstream pull request: https://github.com/ml-explore/mlx/pull/XXXX (closes #4435).
+  Upstream pull request: https://github.com/ml-explore/mlx/pull/4812 (closes #4435).
 
 ## Setup
 
